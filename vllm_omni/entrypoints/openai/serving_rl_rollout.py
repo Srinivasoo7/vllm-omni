@@ -1,23 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Serving layer for RL rollout (RFC #3747, P0).
 
 P0 scope: world_model_env mode, single-session, DreamZero backbone.
 
-# Assumption: action -> obs folding
-# DreamZero's diffusion pass jointly denoises (video_latent, action_latent)
-# from random noise; it does NOT accept an action as a conditioning input at
-# inference time. For world_model_env the client-provided Action is therefore
-# treated as the previously-executed proprioceptive feedback and is
-# concatenated with Observation.state before being passed as
-# robot_obs["state"]. The model's video_out (predicted next frame) is returned
-# as the next observation. This assumption MUST be validated against the merged
-# DreamZero I/O schema (PR #2162) before implementing P1 batched rollouts.
+P0 maps client rollout input onto DreamZero's DROID robot_obs schema and returns
+DreamZero video latents explicitly. RGB/frame decoding can be added as a later
+contract without pretending the latent is already an image observation.
 """
 
 from __future__ import annotations
 
-import base64
+import binascii
 import time
 from collections import abc
 from typing import Any
@@ -50,48 +44,60 @@ logger = init_logger(__name__)
 
 
 def _merge_action_into_obs(obs: Observation, action: Action | None) -> dict[str, Any]:
-    """Build robot_obs dict, folding action into state (see module assumption)."""
+    """Build DreamZero-compatible robot_obs."""
     robot_obs: dict[str, Any] = {"prompt": obs.prompt}
 
     if obs.images:
         robot_obs.update(obs.images)
 
     if obs.extra:
-        robot_obs.update(obs.extra)
+        for key, value in obs.extra.items():
+            if key.startswith("observation/") or key in {"seed", "embodiment_name"}:
+                robot_obs[key] = value
 
-    state_parts: list[list[float]] = []
-    if obs.state:
-        state_parts.append(obs.state)
-    if action is not None and action.joint_positions:
-        state_parts.append(action.joint_positions)
-    if action is not None and action.extra:
-        for v in action.extra.values():
-            if isinstance(v, list):
-                state_parts.append(v)
+    joint_positions = action.joint_positions if action is not None else None
+    gripper_position = action.gripper_position if action is not None else None
 
-    if state_parts:
-        robot_obs["state"] = np.concatenate([np.asarray(p, dtype=np.float64) for p in state_parts])
+    if joint_positions is None and obs.state:
+        joint_positions = obs.state[:7]
+        if len(obs.state) > 7 and gripper_position is None:
+            gripper_position = obs.state[7:8]
+
+    if joint_positions is not None:
+        joint_arr = np.asarray(joint_positions, dtype=np.float64).flatten()
+        if joint_arr.size != 7:
+            raise ValueError(f"DreamZero DROID joint_positions must have 7 values, got {joint_arr.size}.")
+        robot_obs["observation/joint_position"] = joint_arr
+
+    if gripper_position is not None:
+        gripper_arr = np.asarray(gripper_position, dtype=np.float64).flatten()
+        if gripper_arr.size != 1:
+            raise ValueError(f"DreamZero DROID gripper_position must have 1 value, got {gripper_arr.size}.")
+        robot_obs["observation/gripper_position"] = gripper_arr
 
     return robot_obs
 
 
 def _encode_video_output(video: Any) -> dict[str, Any]:
-    """Encode raw video tensor / ndarray to a JSON-serialisable dict."""
+    """Encode DreamZero video latent tensor / ndarray to JSON metadata."""
     if video is None:
         return {}
     if hasattr(video, "detach") and callable(video.detach):
         video = video.detach()
+    if hasattr(video, "float") and callable(video.float):
+        video = video.float()
     if hasattr(video, "cpu") and callable(video.cpu):
         video = video.cpu()
     if hasattr(video, "numpy"):
         video = video.numpy()
     if isinstance(video, np.ndarray):
         return {
-            "video": base64.b64encode(video.tobytes()).decode(),
+            "video_latent": binascii.b2a_base64(video.tobytes(), newline=False).decode(),
             "shape": list(video.shape),
             "dtype": str(video.dtype),
+            "encoding": "base64_raw_tensor",
         }
-    return {"video": str(video)}
+    return {"video_latent": str(video), "encoding": "string"}
 
 
 class ServingRLRollout:
@@ -110,6 +116,7 @@ class ServingRLRollout:
     # ------------------------------------------------------------------ #
 
     async def create_session(self, req: CreateSessionRequest) -> CreateSessionResponse:
+        self._validate_model(req.model)
         session_id = random_uuid()
         session = await self._store.create(
             session_id=session_id,
@@ -138,7 +145,7 @@ class ServingRLRollout:
         logger.info("Closed rollout session %s", session_id)
 
     async def get_status(self, session_id: str) -> SessionStatusResponse:
-        session = await self._store.get(session_id)
+        session = await self._store.get(session_id, include_closed=True)
         return SessionStatusResponse(
             session_id=session_id,
             committed_step_id=session.committed_step_id,
@@ -206,14 +213,23 @@ class ServingRLRollout:
         reset = committed == -1 or not req.use_session_context
         engine_session_id = session.session_id
         if not req.use_session_context:
-            engine_session_id = f"{session.session_id}:stateless:{random_uuid()}"
-        robot_obs = _merge_action_into_obs(req.observation, req.action)
-
+            engine_session_id = f"{session.session_id}:stateless"
         try:
+            robot_obs = _merge_action_into_obs(req.observation, req.action)
             video_out = await self._infer_world_model(
                 obs=robot_obs,
                 session_id=engine_session_id,
                 reset=reset,
+            )
+            next_observation = _encode_video_output(video_out)
+        except ValueError as exc:
+            logger.info("Invalid rollout step %d for session %s: %s", req.step_id, session.session_id, exc)
+            return self._error_response(
+                req.step_id,
+                committed,
+                session.context_length,
+                "invalid_request",
+                str(exc),
             )
         except Exception as exc:
             logger.exception("Step %d failed for session %s", req.step_id, session.session_id)
@@ -240,7 +256,7 @@ class ServingRLRollout:
         )
         return RolloutStepResponse(
             step_id=req.step_id,
-            next_observation=_encode_video_output(video_out),
+            next_observation=next_observation,
             model_metadata=metadata,
         )
 
@@ -261,7 +277,7 @@ class ServingRLRollout:
         request = self._openpi.build_request(obs, session_id=session_id, reset=reset)
         result = None
         async for output in self._openpi.engine_client.generate(
-            prompt=request.prompts[0],
+            prompt=self._request_prompt(request),
             request_id=request.request_id,
             sampling_params_list=[request.sampling_params],
         ):
@@ -282,9 +298,26 @@ class ServingRLRollout:
             )
         return video
 
+    @staticmethod
+    def _request_prompt(request: Any) -> Any:
+        prompt = getattr(request, "prompt", None)
+        if prompt is not None:
+            return prompt
+        return request.prompts[0]
+
     # ------------------------------------------------------------------ #
     # Helpers                                                              #
     # ------------------------------------------------------------------ #
+
+    def _validate_model(self, requested_model: str) -> None:
+        served_model = getattr(self._openpi, "model_name", None)
+        if served_model is None:
+            return
+        if requested_model == served_model:
+            return
+        if requested_model.lower() == "dreamzero" and "dreamzero" in served_model.lower():
+            return
+        raise ValueError(f"Requested rollout model {requested_model!r} does not match served model {served_model!r}.")
 
     @staticmethod
     def _error_response(

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """In-memory session store for RL rollout serving (RFC #3747, P0).
 
 Each RolloutSession holds a per-session asyncio.Lock so that concurrent step
@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Literal
 
@@ -25,6 +26,10 @@ class RolloutSessionClosedError(RuntimeError):
 
 
 class RolloutSessionStepError(ValueError):
+    pass
+
+
+class RolloutSessionCapacityError(RuntimeError):
     pass
 
 
@@ -43,25 +48,31 @@ class RolloutSession:
 class RolloutSessionStore:
     """Thread-safe (asyncio) store for active rollout sessions."""
 
-    def __init__(self) -> None:
-        self._sessions: dict[str, RolloutSession] = {}
+    def __init__(self, max_sessions: int = 64) -> None:
+        self._sessions: OrderedDict[str, RolloutSession] = OrderedDict()
+        self._max_sessions = max_sessions
         self._store_lock = asyncio.Lock()
 
-    async def create(self, session_id: str, model: str, mode: str) -> RolloutSession:
+    async def create(self, session_id: str, model: str, mode: Literal["world_model_env"]) -> RolloutSession:
         async with self._store_lock:
+            self._evict_closed_sessions_for_create()
+            if len(self._sessions) >= self._max_sessions:
+                raise RolloutSessionCapacityError(f"Maximum active rollout sessions reached: {self._max_sessions}.")
             session = RolloutSession(
                 session_id=session_id,
                 model=model,
-                mode=mode,  # type: ignore[arg-type]
+                mode=mode,
             )
             self._sessions[session_id] = session
+            self._sessions.move_to_end(session_id)
             return session
 
-    async def get(self, session_id: str) -> RolloutSession:
+    async def get(self, session_id: str, *, include_closed: bool = False) -> RolloutSession:
         session = self._sessions.get(session_id)
         if session is None:
             raise RolloutSessionNotFoundError(session_id)
-        if session.closed:
+        self._sessions.move_to_end(session_id)
+        if session.closed and not include_closed:
             raise RolloutSessionClosedError(session_id)
         return session
 
@@ -73,8 +84,9 @@ class RolloutSessionStore:
         return session
 
     async def close(self, session_id: str) -> None:
-        session = await self.get(session_id)
-        session.closed = True
+        session = await self.get(session_id, include_closed=True)
+        async with session.lock:
+            session.closed = True
 
     async def advance(self, session_id: str, step_id: int) -> None:
         """Commit a successfully completed step. Called only on success."""
@@ -84,3 +96,12 @@ class RolloutSessionStore:
             raise RolloutSessionStepError(f"Expected step_id {expected_step_id}, got {step_id}.")
         session.committed_step_id = step_id
         session.context_length += 1
+
+    def _evict_closed_sessions_for_create(self) -> None:
+        while len(self._sessions) >= self._max_sessions:
+            for session_id, session in self._sessions.items():
+                if session.closed:
+                    del self._sessions[session_id]
+                    break
+            else:
+                break

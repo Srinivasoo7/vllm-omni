@@ -1,15 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Pydantic schemas for RL rollout serving (RFC #3747).
 
 P0 scope: world_model_env mode only (observation + action -> next observation).
 
-Assumption: the client-provided Action is NOT fed as a denoising-time input to
-DreamZero. Instead it is concatenated with the Observation.state vector and
-passed as robot_obs["state"] (proprioception) on the NEXT step. DreamZero's
-diffusion pass jointly generates (next_video, predicted_action); world_model_env
-uses the next_video output and ignores predicted_action. This assumption must be
-validated against the merged DreamZero I/O schema before P1.
+P0 maps rollout observations/actions onto DreamZero's DROID robot_obs schema:
+camera images retain their DreamZero observation/* keys, joint/gripper state is
+passed through observation/joint_position and observation/gripper_position, and
+the returned video payload is the DreamZero VAE latent unless a later endpoint
+adds explicit latent decoding.
 """
 
 from __future__ import annotations
@@ -22,9 +21,9 @@ from pydantic import BaseModel, Field
 class Observation(BaseModel):
     """Single-step robot observation."""
 
-    images: dict[str, list | str] | None = Field(
+    images: dict[str, list] | None = Field(
         default=None,
-        description="Named camera images as nested float lists (H, W, C) or base64 strings.",
+        description="Named DreamZero camera images as nested numeric lists. Base64 strings are not accepted in P0.",
     )
     state: list[float] | None = Field(
         default=None,
@@ -38,11 +37,15 @@ class Observation(BaseModel):
 
 
 class Action(BaseModel):
-    """Executed action for world_model_env conditioning (see module assumption)."""
+    """Executed action for world_model_env conditioning."""
 
     joint_positions: list[float] | None = Field(
         default=None,
-        description="Executed joint positions; concatenated with Observation.state.",
+        description="Executed joint positions; forwarded as observation/joint_position for DreamZero.",
+    )
+    gripper_position: float | list[float] | None = Field(
+        default=None,
+        description="Executed gripper position; forwarded as observation/gripper_position for DreamZero.",
     )
     extra: dict[str, Any] = Field(default_factory=dict)
 
@@ -90,7 +93,7 @@ class RolloutStepResponse(BaseModel):
     step_id: int
     next_observation: dict[str, Any] | None = Field(
         default=None,
-        description="Predicted next observation. Contains 'video' key with base64-encoded frames.",
+        description="Predicted next observation metadata. P0 returns DreamZero video_latent, not RGB frames.",
     )
     model_metadata: SessionMetadata
     error: ErrorObject | None = None

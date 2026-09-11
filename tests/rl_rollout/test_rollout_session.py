@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unit tests for RolloutSessionStore (RFC #3747, P0)."""
 
 import asyncio
@@ -13,6 +13,8 @@ from vllm_omni.entrypoints.openai.rollout_session import (
     RolloutSessionStepError,
     RolloutSessionStore,
 )
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 @pytest.fixture
@@ -58,11 +60,12 @@ async def test_close_missing_raises(store):
 
 
 @pytest.mark.asyncio
-async def test_close_closed_raises(store):
+async def test_close_is_idempotent(store):
     await store.create("s1", model="dreamzero", mode="world_model_env")
     await store.close("s1")
-    with pytest.raises(RolloutSessionClosedError):
-        await store.close("s1")
+    await store.close("s1")
+    s = await store.get("s1", include_closed=True)
+    assert s.closed
 
 
 @pytest.mark.asyncio
@@ -105,6 +108,9 @@ async def test_advance_rejects_out_of_order_step_id(store):
 @pytest.mark.asyncio
 async def test_reset_clears_state(store):
     await store.create("s1", model="dreamzero", mode="world_model_env")
+    await store.advance("s1", step_id=0)
+    await store.advance("s1", step_id=1)
+    await store.advance("s1", step_id=2)
     await store.advance("s1", step_id=3)
     await store.reset("s1")
     s = await store.get("s1")

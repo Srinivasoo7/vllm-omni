@@ -151,6 +151,7 @@ from vllm_omni.entrypoints.openai.protocol.videos import (
 )
 from vllm_omni.entrypoints.openai.realtime_connection import RealtimeConnection
 from vllm_omni.entrypoints.openai.rollout_session import (
+    RolloutSessionCapacityError,
     RolloutSessionClosedError,
     RolloutSessionNotFoundError,
 )
@@ -1556,13 +1557,29 @@ def _rl_rollout_serving(request: Request) -> ServingRLRollout:
 @router.post("/v1/realtime/sessions")
 async def create_rollout_session(body: CreateSessionRequest, request: Request):
     serving = _rl_rollout_serving(request)
-    return (await serving.create_session(body)).model_dump()
+    try:
+        return (await serving.create_session(body)).model_dump()
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RolloutSessionCapacityError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
 @router.post("/v1/realtime/sessions/{session_id}/step")
 async def rollout_step(session_id: str, body: RolloutStepRequest, request: Request):
     serving = _rl_rollout_serving(request)
-    return (await serving.step(session_id, body)).model_dump()
+    response = await serving.step(session_id, body)
+    if response.error is not None:
+        status_code = None
+        if response.error.code == "session_not_found":
+            status_code = 404
+        elif response.error.code == "session_closed":
+            status_code = 410
+        elif response.error.code in {"invalid_request", "step_already_committed", "step_out_of_order"}:
+            status_code = 400
+        if status_code is not None:
+            return JSONResponse(content=response.model_dump(), status_code=status_code)
+    return response.model_dump()
 
 
 @router.post("/v1/realtime/sessions/{session_id}/reset")
@@ -1585,7 +1602,7 @@ async def close_rollout_session(session_id: str, request: Request):
     except RolloutSessionNotFoundError:
         raise HTTPException(status_code=404, detail=f"Session {session_id!r} not found.")
     except RolloutSessionClosedError:
-        raise HTTPException(status_code=410, detail=f"Session {session_id!r} is closed.")
+        return {"session_id": session_id, "closed": True}
 
 
 @router.get("/v1/realtime/sessions/{session_id}/status")

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unit tests for ServingRLRollout (RFC #3747, P0).
 
 The DreamZero engine is mocked. Tests verify session lifecycle, step_id
@@ -21,6 +21,8 @@ from vllm_omni.entrypoints.openai.protocol.rollout import (
     RolloutStepRequest,
 )
 from vllm_omni.entrypoints.openai.serving_rl_rollout import ServingRLRollout
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -85,8 +87,9 @@ async def test_get_status_after_create(serving):
 async def test_close_session(serving):
     resp = await serving.create_session(CreateSessionRequest(model="dreamzero", mode="world_model_env"))
     await serving.close_session(resp.session_id)
-    # closed session state is tested at the session-store level;
-    # HTTP 410 behavior is verified via route integration tests
+    status = await serving.get_status(resp.session_id)
+    assert status.closed
+    assert status.committed_step_id == -1
 
 
 # ---------------------------------------------------------------------------
@@ -139,7 +142,7 @@ async def test_next_observation_present_on_success(serving):
     )
     resp = await serving.step(sess.session_id, req)
     assert resp.next_observation is not None
-    assert "video" in resp.next_observation
+    assert "video_latent" in resp.next_observation
     assert resp.next_observation["dtype"] == "float32"
 
 
@@ -190,8 +193,7 @@ async def test_stateless_step_does_not_commit_context(serving):
     serving._openpi.build_request.assert_called_once()
     kwargs = serving._openpi.build_request.call_args.kwargs
     assert kwargs["reset"] is True
-    assert kwargs["session_id"] != sess.session_id
-    assert kwargs["session_id"].startswith(f"{sess.session_id}:stateless:")
+    assert kwargs["session_id"] == f"{sess.session_id}:stateless"
 
 
 # ---------------------------------------------------------------------------
@@ -210,6 +212,34 @@ async def test_failed_step_does_not_advance_committed_step_id():
     assert resp.error.code == "inference_error"
     assert resp.model_metadata.committed_step_id == -1  # must not have advanced
 
+    status = await serving.get_status(sess.session_id)
+    assert status.committed_step_id == -1
+
+
+@pytest.mark.asyncio
+async def test_output_encoding_failure_does_not_advance_committed_step_id():
+    class BadVideo:
+        def detach(self):
+            return self
+
+        def float(self):
+            return self
+
+        def cpu(self):
+            return self
+
+        def numpy(self):
+            raise TypeError("cannot encode")
+
+    serving = ServingRLRollout(_make_openpi(video=BadVideo()))
+    sess = await serving.create_session(CreateSessionRequest(model="dreamzero", mode="world_model_env"))
+    req = RolloutStepRequest(step_id=0, observation=Observation(), action=Action())
+
+    resp = await serving.step(sess.session_id, req)
+
+    assert resp.error is not None
+    assert resp.error.code == "inference_error"
+    assert resp.model_metadata.committed_step_id == -1
     status = await serving.get_status(sess.session_id)
     assert status.committed_step_id == -1
 
@@ -264,23 +294,25 @@ async def test_reset_clears_committed_step_id(serving):
 # ---------------------------------------------------------------------------
 
 
-def test_merge_action_into_obs_concatenates_state():
+def test_merge_action_into_obs_emits_dreamzero_state_keys():
     from vllm_omni.entrypoints.openai.serving_rl_rollout import _merge_action_into_obs
 
-    obs = Observation(state=[1.0, 2.0], prompt="test")
-    action = Action(joint_positions=[3.0, 4.0, 5.0])
+    obs = Observation(state=[9.0] * 8, prompt="test")
+    action = Action(joint_positions=[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0], gripper_position=0.5)
     result = _merge_action_into_obs(obs, action)
 
     assert result["prompt"] == "test"
-    np.testing.assert_array_almost_equal(result["state"], [1.0, 2.0, 3.0, 4.0, 5.0])
+    np.testing.assert_array_almost_equal(result["observation/joint_position"], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0])
+    np.testing.assert_array_almost_equal(result["observation/gripper_position"], [0.5])
 
 
-def test_merge_action_none_uses_obs_state_only():
+def test_merge_action_none_splits_obs_state_for_dreamzero():
     from vllm_omni.entrypoints.openai.serving_rl_rollout import _merge_action_into_obs
 
-    obs = Observation(state=[1.0, 2.0])
+    obs = Observation(state=[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 0.25])
     result = _merge_action_into_obs(obs, None)
-    np.testing.assert_array_almost_equal(result["state"], [1.0, 2.0])
+    np.testing.assert_array_almost_equal(result["observation/joint_position"], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0])
+    np.testing.assert_array_almost_equal(result["observation/gripper_position"], [0.25])
 
 
 def test_merge_no_state_no_action_omits_state_key():
@@ -288,4 +320,12 @@ def test_merge_no_state_no_action_omits_state_key():
 
     obs = Observation()
     result = _merge_action_into_obs(obs, None)
-    assert "state" not in result
+    assert "observation/joint_position" not in result
+    assert "observation/gripper_position" not in result
+
+
+def test_merge_rejects_wrong_dreamzero_joint_dimension():
+    from vllm_omni.entrypoints.openai.serving_rl_rollout import _merge_action_into_obs
+
+    with pytest.raises(ValueError, match="joint_positions must have 7 values"):
+        _merge_action_into_obs(Observation(), Action(joint_positions=[1.0, 2.0]))
