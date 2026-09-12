@@ -29,26 +29,34 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 # ---------------------------------------------------------------------------
 
 
-def _make_fake_result(video: Any = None) -> MagicMock:
+def _make_fake_result(video: Any = None, *, formatter_shaped: bool = True) -> MagicMock:
     result = MagicMock()
     if video is None:
         video = np.zeros((1, 3, 64, 64), dtype=np.float32)
-    result.multimodal_output = {"video": video}
+    if formatter_shaped:
+        # Matches output_formatter: video is peeled into images; mm only has actions.
+        result.images = video
+        result.multimodal_output = {"actions": np.zeros((1, 8), dtype=np.float32)}
+    else:
+        result.images = None
+        result.multimodal_output = {"video": video}
     return result
 
 
-def _make_openpi(video: Any = None, raises: Exception | None = None):
+def _make_openpi(video: Any = None, raises: Exception | None = None, *, formatter_shaped: bool = True):
     openpi = MagicMock()
     openpi.engine_client = MagicMock()
+    openpi.model_name = None
 
     async def _generate(*_, **__):
         if raises:
             raise raises
-        yield _make_fake_result(video)
+        yield _make_fake_result(video, formatter_shaped=formatter_shaped)
 
     openpi.engine_client.generate = _generate
     openpi.build_request = MagicMock(
         return_value=MagicMock(
+            prompt="",
             prompts=[""],
             request_id="test-req",
             sampling_params=MagicMock(),
@@ -90,6 +98,8 @@ async def test_close_session(serving):
     status = await serving.get_status(resp.session_id)
     assert status.closed
     assert status.committed_step_id == -1
+    serving._openpi.drop_session.assert_any_call(resp.session_id)
+    serving._openpi.drop_session.assert_any_call(f"{resp.session_id}:stateless")
 
 
 # ---------------------------------------------------------------------------
@@ -287,6 +297,7 @@ async def test_reset_clears_committed_step_id(serving):
     status = await serving.get_status(sess.session_id)
     assert status.committed_step_id == -1
     assert status.context_length == 0
+    serving._openpi.drop_session.assert_called_with(sess.session_id)
 
 
 # ---------------------------------------------------------------------------
@@ -329,3 +340,32 @@ def test_merge_rejects_wrong_dreamzero_joint_dimension():
 
     with pytest.raises(ValueError, match="joint_positions must have 7 values"):
         _merge_action_into_obs(Observation(), Action(joint_positions=[1.0, 2.0]))
+
+
+@pytest.mark.asyncio
+async def test_step_reads_formatter_images_not_multimodal_video():
+    video = np.ones((1, 3, 8, 8), dtype=np.float32)
+    serving = ServingRLRollout(_make_openpi(video=video, formatter_shaped=True))
+    sess = await serving.create_session(CreateSessionRequest(model="dreamzero", mode="world_model_env"))
+    resp = await serving.step(
+        sess.session_id,
+        RolloutStepRequest(step_id=0, observation=Observation(), action=Action()),
+    )
+    assert resp.error is None
+    assert resp.next_observation is not None
+    assert "video_latent" in resp.next_observation
+    assert resp.next_observation["shape"] == [1, 3, 8, 8]
+
+
+@pytest.mark.asyncio
+async def test_step_falls_back_to_multimodal_video():
+    video = np.ones((2, 4, 4), dtype=np.float32)
+    serving = ServingRLRollout(_make_openpi(video=video, formatter_shaped=False))
+    sess = await serving.create_session(CreateSessionRequest(model="dreamzero", mode="world_model_env"))
+    resp = await serving.step(
+        sess.session_id,
+        RolloutStepRequest(step_id=0, observation=Observation(), action=Action()),
+    )
+    assert resp.error is None
+    assert resp.next_observation is not None
+    assert resp.next_observation["shape"] == [2, 4, 4]

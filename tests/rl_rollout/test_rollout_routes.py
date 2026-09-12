@@ -150,12 +150,13 @@ def test_close_route_maps_missing_session_to_404():
     assert response.status_code == 404
 
 
-def test_close_route_maps_closed_session_to_410():
+def test_close_route_is_idempotent_for_closed_session():
     client = _client(_FakeRolloutServing(close_error=RolloutSessionClosedError("s1")))
 
     response = client.post("/v1/realtime/sessions/s1/close")
 
-    assert response.status_code == 410
+    assert response.status_code == 200
+    assert response.json()["closed"] is True
 
 
 def test_rollout_routes_return_501_when_serving_is_unavailable():

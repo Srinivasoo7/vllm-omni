@@ -132,8 +132,9 @@ class ServingRLRollout:
 
     async def reset_session(self, session_id: str) -> ResetSessionResponse:
         session = await self._store.reset(session_id)
-        # Tell the engine to drop KV state for this session on the next call
-        # by passing reset=True; no engine call is issued here.
+        # Next infer still passes reset=True; drop GPU KV now if the engine
+        # session is reachable from this process.
+        self._drop_engine_session(session_id)
         logger.info("Reset rollout session %s", session_id)
         return ResetSessionResponse(
             session_id=session_id,
@@ -142,6 +143,8 @@ class ServingRLRollout:
 
     async def close_session(self, session_id: str) -> None:
         await self._store.close(session_id)
+        self._drop_engine_session(session_id)
+        self._drop_engine_session(f"{session_id}:stateless")
         logger.info("Closed rollout session %s", session_id)
 
     async def get_status(self, session_id: str) -> SessionStatusResponse:
@@ -271,8 +274,9 @@ class ServingRLRollout:
 
         Reuses ServingRealtimeRobotOpenPI.build_request() so request routing,
         session_id threading, and OmniDiffusionSamplingParams construction are
-        identical to the policy_inference path. Only the output extraction
-        differs: we pull multimodal_output["video"] instead of ["actions"].
+        identical to the policy_inference path. DreamZero's formatter peels
+        ``video`` into ``result.images`` and leaves only ``actions`` on
+        ``multimodal_output``; read images first and fall back to the raw key.
         """
         request = self._openpi.build_request(obs, session_id=session_id, reset=reset)
         result = None
@@ -285,18 +289,7 @@ class ServingRLRollout:
 
         if result is None:
             raise RuntimeError("World model request produced no output.")
-
-        multimodal_output = getattr(result, "multimodal_output", None)
-        if not isinstance(multimodal_output, abc.Mapping):
-            raise RuntimeError("Missing multimodal_output in world model result.")
-
-        video = multimodal_output.get("video")
-        if video is None:
-            raise RuntimeError(
-                "multimodal_output['video'] is None. "
-                "Confirm DreamZero returns video in world_model_env mode (see module assumption)."
-            )
-        return video
+        return self._extract_video_output(result)
 
     @staticmethod
     def _request_prompt(request: Any) -> Any:
@@ -304,6 +297,37 @@ class ServingRLRollout:
         if prompt is not None:
             return prompt
         return request.prompts[0]
+
+    @staticmethod
+    def _extract_video_output(result: Any) -> Any:
+        """Prefer formatter-placed ``images``; fall back to multimodal video."""
+        images = getattr(result, "images", None)
+        if isinstance(images, (list, tuple)):
+            if images:
+                return images[0]
+        elif images is not None and not isinstance(images, abc.Mapping):
+            # Formatter assigns the peeled video tensor directly to images.
+            return images
+
+        multimodal_output = getattr(result, "multimodal_output", None)
+        if isinstance(multimodal_output, abc.Mapping):
+            video = multimodal_output.get("video")
+            if video is not None:
+                return video
+
+        raise RuntimeError(
+            "No video on result.images or multimodal_output['video']. "
+            "Confirm DreamZero formatter placement for world_model_env."
+        )
+
+    def _drop_engine_session(self, session_id: str) -> None:
+        drop = getattr(self._openpi, "drop_session", None)
+        if not callable(drop):
+            return
+        try:
+            drop(session_id)
+        except Exception:
+            logger.exception("Failed to drop engine session %s", session_id)
 
     # ------------------------------------------------------------------ #
     # Helpers                                                              #
