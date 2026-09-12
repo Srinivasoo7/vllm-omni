@@ -1579,8 +1579,13 @@ async def reset_rollout_session(session_id: str, request: Request):
 @router.post("/v1/realtime/sessions/{session_id}/close")
 async def close_rollout_session(session_id: str, request: Request):
     serving = _rl_rollout_serving(request)
-    await serving.close_session(session_id)
-    return {"session_id": session_id, "closed": True}
+    try:
+        await serving.close_session(session_id)
+        return {"session_id": session_id, "closed": True}
+    except RolloutSessionNotFoundError:
+        raise HTTPException(status_code=404, detail=f"Session {session_id!r} not found.")
+    except RolloutSessionClosedError:
+        raise HTTPException(status_code=410, detail=f"Session {session_id!r} is closed.")
 
 
 @router.get("/v1/realtime/sessions/{session_id}/status")
